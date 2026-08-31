@@ -26,7 +26,7 @@ BASE_SHARP = "https://api.sharpapi.io/api/v1"
 # ─── ENDPOINTS ──────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/debug"]}
+    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/debug", "/diagnostic"]}
 
 @app.get("/health")
 async def health():
@@ -39,16 +39,126 @@ async def debug():
     try:
         r = requests.get(f"{BASE_BB}/matches", headers=HEADERS_BB,
                          params={"sport": "football", "date": today, "per_page": 3}, timeout=30)
-        out["bigballs"] = {"status": r.status_code, "preview": str(r.text)[:500]}
+        out["bigballs"] = {"status": r.status_code, "preview": str(r.text)[:800]}
     except Exception as e:
         out["bigballs"] = {"error": str(e)}
     try:
         r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
                          params={"sport": "soccer", "date": today, "per_page": 10}, timeout=15)
-        out["sharpapi"] = {"status": r.status_code, "preview": str(r.text)[:500]}
+        out["sharpapi"] = {"status": r.status_code, "preview": str(r.text)[:800]}
     except Exception as e:
         out["sharpapi"] = {"error": str(e)}
     return out
+
+@app.get("/diagnostic")
+async def diagnostic():
+    """Shows exactly what the engine sees — fixtures, odds, matching, probabilities."""
+    today = datetime.now(SAST).strftime("%Y-%m-%d")
+    diag = {"date": today, "fixtures": [], "odds_count": 0, "matches_with_odds": 0, "value_picks": []}
+
+    # Fetch fixtures
+    try:
+        r = requests.get(f"{BASE_BB}/matches", headers=HEADERS_BB,
+                         params={"sport": "football", "date": today, "include": "stats,elo,lineups,injuries", "per_page": 100}, timeout=30)
+        fixtures = r.json().get("data", []) if isinstance(r.json(), dict) else r.json() if isinstance(r.json(), list) else []
+    except Exception as e:
+        return {"error": f"Big Balls failed: {str(e)}"}
+
+    # Fetch all odds
+    try:
+        r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
+                         params={"sport": "soccer", "date": today, "per_page": 500}, timeout=15)
+        all_odds = r.json().get("data", []) if isinstance(r.json(), dict) else r.json() if isinstance(r.json(), list) else []
+    except Exception as e:
+        return {"error": f"SharpAPI failed: {str(e)}"}
+
+    diag["odds_count"] = len(all_odds)
+
+    # Show first 3 fixtures and their matched odds
+    for match in fixtures[:5]:
+        if not isinstance(match, dict):
+            continue
+        home = match.get("home", {}).get("name", "") if isinstance(match.get("home"), dict) else ""
+        away = match.get("away", {}).get("name", "") if isinstance(match.get("away"), dict) else ""
+
+        # Find matching odds
+        match_odds = []
+        for odd in all_odds:
+            if not isinstance(odd, dict):
+                continue
+            oh = str(odd.get("home_team", "")).lower()
+            oa = str(odd.get("away_team", "")).lower()
+            if home and away and (home.lower() in oh or oh in home.lower()) and (away.lower() in oa or oa in away.lower()):
+                match_odds.append({
+                    "book": odd.get("sportsbook"),
+                    "market": odd.get("market_type"),
+                    "selection": odd.get("selection"),
+                    "odds": odd.get("odds_decimal")
+                })
+
+        # Get Elo
+        elo = match.get("predictions", {}).get("elo", {}) if isinstance(match.get("predictions"), dict) else {}
+
+        # Get stats
+        h_stats = match.get("home", {}).get("recent_stats", {}) if isinstance(match.get("home"), dict) else {}
+        a_stats = match.get("away", {}).get("recent_stats", {}) if isinstance(match.get("away"), dict) else {}
+
+        # Simple Poisson with defaults
+        league_avg = 2.65
+        home_att = h_stats.get("goals_scored_pg", 1.4) / (league_avg / 2) if h_stats else 1.0
+        home_def = h_stats.get("goals_conceded_pg", 1.1) / (league_avg / 2) if h_stats else 1.0
+        away_att = a_stats.get("goals_scored_pg", 1.2) / (league_avg / 2) if a_stats else 1.0
+        away_def = a_stats.get("goals_conceded_pg", 1.3) / (league_avg / 2) if a_stats else 1.0
+
+        elo_diff = (elo.get("home_elo", 1500) - elo.get("away_elo", 1500)) / 400
+        elo_mult = 10 ** elo_diff
+        lambda_h = (league_avg / 2) * home_att * away_def * 1.35 * elo_mult
+        lambda_a = (league_avg / 2) * away_att * home_def / elo_mult
+
+        # Quick simulation (1000 runs for speed)
+        np.random.seed(42)
+        hg = np.random.poisson(max(lambda_h, 0.3), 1000)
+        ag = np.random.poisson(max(lambda_a, 0.3), 1000)
+        home_win_prob = float(np.mean(hg > ag))
+        over25_prob = float(np.mean((hg + ag) > 2.5))
+        btts_prob = float(np.mean((hg > 0) & (ag > 0)))
+
+        # Check for value in moneyline home win
+        home_odd = None
+        for odd in match_odds:
+            if odd["market"] == "moneyline" and "home" in str(odd["selection"]).lower():
+                home_odd = odd["odds"]
+                break
+
+        edge = None
+        if home_odd:
+            implied = 1 / home_odd
+            edge = round(home_win_prob - implied, 3)
+
+        diag["fixtures"].append({
+            "fixture": f"{home} vs {away}",
+            "has_stats": bool(h_stats and a_stats),
+            "elo_home": elo.get("home_elo"),
+            "elo_away": elo.get("away_elo"),
+            "lambda_h": round(lambda_h, 2),
+            "lambda_a": round(lambda_a, 2),
+            "sim_home_win": round(home_win_prob, 2),
+            "sim_over25": round(over25_prob, 2),
+            "sim_btts": round(btts_prob, 2),
+            "odds_found": len(match_odds),
+            "sample_odds": match_odds[:3],
+            "home_odd": home_odd,
+            "implied_prob": round(1/home_odd, 3) if home_odd else None,
+            "edge": edge
+        })
+
+        if match_odds:
+            diag["matches_with_odds"] += 1
+
+        if edge and edge > 0:
+            diag["value_picks"].append({"fixture": f"{home} vs {away}", "edge": edge})
+
+    return diag
 
 @app.get("/analyze")
 @app.post("/analyze")
