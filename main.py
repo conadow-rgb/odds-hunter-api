@@ -261,15 +261,20 @@ class MonteCarloEngine:
         }
 
 # ─── FASTAPI ENDPOINTS ──────────────────────────────
-@app.post("/analyze", response_model=AnalyzeResponse)
+@app.get("/")
+async def root():
+    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze"]}
+
+@app.get("/health")
+async def health():
+    return {"status": "alive", "time": datetime.now(SAST).isoformat()}
+
+@app.get("/analyze")
+@app.post("/analyze")
 async def analyze():
     try:
         engine = MonteCarloEngine(simulations=20000)
         result = engine.run()
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health():
-    return {"status": "alive", "time": datetime.now(SAST).isoformat()}
+        return {"status": "error", "message": str(e)}
