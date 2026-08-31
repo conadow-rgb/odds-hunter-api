@@ -22,6 +22,16 @@ HEADERS_BZZ = {"Authorization": f"Bearer {BZZOIRO_KEY}"} if BZZOIRO_KEY else {}
 HEADERS_SHARP = {"X-API-Key": SHARPAPI_KEY}
 BASE_SHARP = "https://api.sharpapi.io/api/v1"
 
+# ─── REALISTIC ODDS RANGES ──────────────────────────
+# Reject odds outside these ranges per market type
+ODDS_RANGES = {
+    "moneyline": {"min": 1.05, "max": 15.0},
+    "totals": {"min": 1.3, "max": 5.0},
+    "both_teams_to_score": {"min": 1.3, "max": 5.0},
+    "double_chance": {"min": 1.05, "max": 5.0},
+    "spreads": {"min": 1.3, "max": 5.0},
+}
+
 # ─── LEAGUE PARAMETERS ──────────────────────────────
 LEAGUE_PARAMS = {
     "premier_league": {"avg_goals": 2.7, "home_adv": 1.35},
@@ -86,11 +96,9 @@ async def diagnostic():
 
 @app.get("/scan-debug")
 async def scan_debug():
-    """Show exactly what happens during market scanning."""
     today = datetime.now(SAST).strftime("%Y-%m-%d")
-    debug = {"date": today, "matches": []}
+    debug = {"date": today, "matches": [], "summary": {"total_odds": 0, "realistic_odds": 0, "exotic_odds": 0}}
 
-    # Fetch all odds
     all_odds = []
     for page in range(1, 3):
         r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
@@ -103,7 +111,8 @@ async def scan_debug():
             break
         all_odds.extend(odds_page)
 
-    # Group by match
+    debug["summary"]["total_odds"] = len(all_odds)
+
     matches = {}
     for odd in all_odds:
         if not isinstance(odd, dict):
@@ -114,82 +123,46 @@ async def scan_debug():
             continue
         key = f"{home} vs {away}"
         if key not in matches:
-            league = str(odd.get("league", "default"))
-            params = get_league_params(league)
-            matches[key] = {
-                "home": home, "away": away, "league": league,
-                "avg_goals": params["avg_goals"], "home_adv": params["home_adv"],
-                "odds": []
-            }
+            matches[key] = {"league": odd.get("league"), "odds": []}
         matches[key]["odds"].append(odd)
 
-    # For each match, show what the scanner sees
-    for key, match in list(matches.items())[:3]:
-        # Run simulation
-        lambda_h = (match["avg_goals"] / 2) * match["home_adv"]
-        lambda_a = match["avg_goals"] / 2
-        np.random.seed(42)
-        hg = np.random.poisson(lambda_h, 20000)
-        ag = np.random.poisson(lambda_a, 20000)
-        tg = hg + ag
-        sim = {
-            "home_win": float(np.mean(hg > ag)),
-            "draw": float(np.mean(hg == ag)),
-            "away_win": float(np.mean(hg < ag)),
-            "over_2.5": float(np.mean(tg > 2.5)),
-            "btts_yes": float(np.mean((hg > 0) & (ag > 0))),
-        }
-
-        # Show each odd and whether it passes filters
+    for key, match in list(matches.items())[:5]:
         odd_debug = []
+        realistic_count = 0
+        exotic_count = 0
+
         for odd in match["odds"]:
-            if not isinstance(odd, dict):
-                continue
             mkt_type = str(odd.get("market_type", "")).lower()
-            selection = str(odd.get("selection", "")).lower()
-            sel_type = str(odd.get("selection_type", "")).lower()
+            price = get_decimal_odds(odd)
 
-            # Get decimal odds
-            dec = odd.get("odds_decimal")
-            if dec and float(dec) > 1.0:
-                price = float(dec)
+            # Check if realistic
+            rng = ODDS_RANGES.get(mkt_type, {"min": 1.0, "max": 100.0})
+            is_realistic = rng["min"] <= price <= rng["max"]
+
+            if is_realistic:
+                realistic_count += 1
             else:
-                american = odd.get("odds_american")
-                if american:
-                    am = int(american)
-                    price = round((am / 100) + 1, 2) if am > 0 else round((100 / abs(am)) + 1, 2)
-                else:
-                    price = 0
-
-            # Check market mapping
-            market_map = {
-                "moneyline": ["home_win", "draw", "away_win"],
-                "totals": ["over_2.5"],
-                "both_teams_to_score": ["btts_yes"],
-            }
-
-            mapped = market_map.get(mkt_type, [])
-            sim_prob = sim.get(mapped[0], 0) if mapped else 0
+                exotic_count += 1
 
             odd_debug.append({
                 "market_type": mkt_type,
-                "selection": selection,
-                "selection_type": sel_type,
+                "selection": odd.get("selection"),
                 "price": price,
-                "in_market_map": bool(mapped),
-                "sim_prob": round(sim_prob, 3),
-                "implied": round(1/price, 3) if price > 0 else 0,
-                "edge": round(sim_prob - 1/price, 3) if price > 0 and mapped else 0,
-                "passes": price > 1.1 and price < 15.0 and bool(mapped) and sim_prob >= 0.10
+                "realistic": is_realistic,
+                "range": rng,
             })
 
         debug["matches"].append({
             "fixture": key,
             "league": match["league"],
-            "simulation": sim,
             "total_odds": len(match["odds"]),
-            "odds_scan": odd_debug
+            "realistic_odds": realistic_count,
+            "exotic_odds": exotic_count,
+            "odds_scan": odd_debug[:10]
         })
+
+        debug["summary"]["realistic_odds"] += realistic_count
+        debug["summary"]["exotic_odds"] += exotic_count
 
     return debug
 
@@ -305,8 +278,9 @@ class FallbackEngine:
                     matched = any(kw in sel_str or kw in sel_type for kw in keywords)
                     if not matched:
                         continue
-                    price = self._get_decimal_odds(odd)
-                    if 1.1 < price < 15.0 and (best_odd is None or price > best_odd):
+                    price = get_decimal_odds(odd)
+                    rng = ODDS_RANGES.get(mkt_type, {"min": 1.0, "max": 100.0})
+                    if rng["min"] <= price <= rng["max"] and (best_odd is None or price > best_odd):
                         best_odd = price
                         book = odd.get("sportsbook", "unknown")
                 if not best_odd:
@@ -447,9 +421,14 @@ class FallbackEngine:
             if mkt_type not in market_map:
                 continue
 
-            best_odd = self._get_decimal_odds(odd)
-            if not best_odd or best_odd < 1.1 or best_odd > 15.0:
+            price = get_decimal_odds(odd)
+            if not price:
                 continue
+
+            # STRICT: Check realistic range
+            rng = ODDS_RANGES.get(mkt_type, {"min": 1.0, "max": 100.0})
+            if not (rng["min"] <= price <= rng["max"]):
+                continue  # Skip exotic/prop odds
 
             selection = str(odd.get("selection", "")).lower()
             sel_type = str(odd.get("selection_type", "")).lower()
@@ -464,21 +443,21 @@ class FallbackEngine:
                 if prob < 0.10:
                     continue
 
-                implied = 1 / best_odd
+                implied = 1 / price
                 if "Under" in sel_label or "No" in sel_label:
                     prob = 1 - prob
 
                 edge = prob - implied
                 if edge >= 0.02 and prob >= 0.40:
                     conf = "A+" if edge > 0.10 else "A" if edge > 0.06 else "B"
-                    exp = f"Monte Carlo ({self.simulations:,} runs): {sel_label} = {prob*100:.1f}%. {book} @ {best_odd} (implied {implied*100:.1f}%). Edge: {edge*100:.1f}%."
+                    exp = f"Monte Carlo ({self.simulations:,} runs): {sel_label} = {prob*100:.1f}%. {book} @ {price} (implied {implied*100:.1f}%). Edge: {edge*100:.1f}%."
                     picks.append({
                         "match_id": f"{home}-{away}",
                         "fixture": f"{home} vs {away}",
                         "league": league,
                         "market": mkt_name,
                         "selection": sel_label,
-                        "odds": best_odd,
+                        "odds": price,
                         "bookmaker": book,
                         "sim_probability": round(prob, 3),
                         "implied_probability": round(implied, 3),
@@ -489,19 +468,6 @@ class FallbackEngine:
 
         picks.sort(key=lambda x: x["edge"], reverse=True)
         return picks
-
-    def _get_decimal_odds(self, odd):
-        dec = odd.get("odds_decimal")
-        if dec and float(dec) > 1.0:
-            return float(dec)
-        american = odd.get("odds_american")
-        if american:
-            am = int(american)
-            if am > 0:
-                return round((am / 100) + 1, 2)
-            else:
-                return round((100 / abs(am)) + 1, 2)
-        return 0
 
     def _build_accas(self, picks, target=10.0, max_legs=6):
         if len(picks) < 2:
@@ -528,3 +494,17 @@ class FallbackEngine:
                 results.sort(key=lambda x: (-x["total_edge"], abs(x["combined_odds"] - target)))
                 return results[:5]
         return results
+
+# ─── STANDALONE HELPER ──────────────────────────────
+def get_decimal_odds(odd):
+    dec = odd.get("odds_decimal")
+    if dec and float(dec) > 1.0:
+        return float(dec)
+    american = odd.get("odds_american")
+    if american:
+        am = int(american)
+        if am > 0:
+            return round((am / 100) + 1, 2)
+        else:
+            return round((100 / abs(am)) + 1, 2)
+    return 0
