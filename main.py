@@ -44,7 +44,7 @@ async def debug():
         out["bigballs"] = {"error": str(e)}
     try:
         r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
-                         params={"league": "EPL", "market_type": "moneyline", "per_page": 3}, timeout=15)
+                         params={"sport": "soccer", "date": today, "per_page": 10}, timeout=15)
         out["sharpapi"] = {"status": r.status_code, "preview": str(r.text)[:500]}
     except Exception as e:
         out["sharpapi"] = {"error": str(e)}
@@ -78,30 +78,30 @@ class MonteCarloEngine:
             return data
         return []
 
-    def fetch_odds(self, leagues):
-        all_odds = []
-        for league in leagues:
-            url = f"{BASE_SHARP}/odds"
-            params = {"league": league, "market_type": "moneyline,totals,btts,spreads", "per_page": 100}
-            r = requests.get(url, headers=HEADERS_SHARP, params=params, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict):
-                    all_odds.extend(data.get("data", []))
-                elif isinstance(data, list):
-                    all_odds.extend(data)
-        return all_odds
+    def fetch_all_odds(self):
+        today = datetime.now(SAST).strftime("%Y-%m-%d")
+        url = f"{BASE_SHARP}/odds"
+        params = {"sport": "soccer", "date": today, "per_page": 500}
+        r = requests.get(url, headers=HEADERS_SHARP, params=params, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get("data", [])
+        if isinstance(data, list):
+            return data
+        return []
 
     def match_odds_to_fixture(self, fixture, all_odds):
         home = ""
         away = ""
         if isinstance(fixture, dict):
-            home = fixture.get("home", {}).get("name", "") if isinstance(fixture.get("home"), dict) else ""
-            if not home:
-                home = fixture.get("home_team", {}).get("name", "") if isinstance(fixture.get("home_team"), dict) else ""
-            away = fixture.get("away", {}).get("name", "") if isinstance(fixture.get("away"), dict) else ""
-            if not away:
-                away = fixture.get("away_team", {}).get("name", "") if isinstance(fixture.get("away_team"), dict) else ""
+            h = fixture.get("home")
+            if isinstance(h, dict):
+                home = h.get("name", "")
+            a = fixture.get("away")
+            if isinstance(a, dict):
+                away = a.get("name", "")
         if not home or not away:
             return []
         match_odds = []
@@ -118,10 +118,10 @@ class MonteCarloEngine:
         if not isinstance(match, dict):
             return 1.4, 1.2
         league_avg = 2.65
-        ht = match.get("home_team", {}) if isinstance(match.get("home_team"), dict) else {}
-        at = match.get("away_team", {}) if isinstance(match.get("away_team"), dict) else {}
-        hs = ht.get("recent_stats", {}) if isinstance(ht.get("recent_stats"), dict) else {}
-        as_ = at.get("recent_stats", {}) if isinstance(at.get("recent_stats"), dict) else {}
+        h = match.get("home", {}) if isinstance(match.get("home"), dict) else {}
+        a = match.get("away", {}) if isinstance(match.get("away"), dict) else {}
+        hs = h.get("recent_stats", {}) if isinstance(h.get("recent_stats"), dict) else {}
+        as_ = a.get("recent_stats", {}) if isinstance(a.get("recent_stats"), dict) else {}
         if not hs or not as_:
             return 1.4, 1.2
         home_att = hs.get("goals_scored_pg", 1.4) / (league_avg / 2)
@@ -165,9 +165,9 @@ class MonteCarloEngine:
     def scan_markets(self, match, sim, match_odds):
         picks = []
         mid = match.get("id", "unknown") if isinstance(match, dict) else "unknown"
-        home = match.get("home_team", {}).get("name", "Home") if isinstance(match, dict) and isinstance(match.get("home_team"), dict) else "Home"
-        away = match.get("away_team", {}).get("name", "Away") if isinstance(match, dict) and isinstance(match.get("away_team"), dict) else "Away"
-        league = match.get("league", {}).get("name", "Unknown") if isinstance(match, dict) and isinstance(match.get("league"), dict) else "Unknown"
+        home = match.get("home", {}).get("name", "Home") if isinstance(match, dict) and isinstance(match.get("home"), dict) else "Home"
+        away = match.get("away", {}).get("name", "Away") if isinstance(match, dict) and isinstance(match.get("away"), dict) else "Away"
+        league = match.get("league", "Unknown") if isinstance(match, dict) else "Unknown"
         markets = [
             ("1X2", "Home Win", "home_win", "moneyline", "home"),
             ("1X2", "Draw", "draw", "moneyline", "draw"),
@@ -190,7 +190,9 @@ class MonteCarloEngine:
                     continue
                 if odd.get("market_type") != mkt_type:
                     continue
-                if selection_key.lower() in str(odd.get("selection", "")).lower():
+                sel_str = str(odd.get("selection", "")).lower()
+                sel_type = str(odd.get("selection_type", "")).lower()
+                if selection_key.lower() in sel_str or selection_key.lower() in sel_type:
                     price = odd.get("odds_decimal", 0)
                     if price > 1.1 and (best_odd is None or price > best_odd):
                         best_odd = price
@@ -242,16 +244,7 @@ class MonteCarloEngine:
         fixtures = self.fetch_fixtures()
         if not fixtures:
             return {"status": "no_matches", "message": "No matches today."}
-        leagues = []
-        for f in fixtures:
-            if isinstance(f, dict):
-                l = f.get("league", {})
-                if isinstance(l, dict):
-                    leagues.append(l.get("name", "EPL"))
-                elif isinstance(l, str):
-                    leagues.append(l)
-        leagues = list(set(leagues))
-        all_odds = self.fetch_odds(leagues)
+        all_odds = self.fetch_all_odds()
         all_picks = []
         for match in fixtures:
             if not isinstance(match, dict):
