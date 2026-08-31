@@ -18,13 +18,11 @@ if not SHARPAPI_KEY:
     raise RuntimeError("SHARPAPI_KEY missing. Set it in Render Environment Variables.")
 
 SAST = ZoneInfo("Africa/Johannesburg")
-
 HEADERS_BZZ = {"Authorization": f"Bearer {BZZOIRO_KEY}"} if BZZOIRO_KEY else {}
 HEADERS_SHARP = {"X-API-Key": SHARPAPI_KEY}
-
 BASE_SHARP = "https://api.sharpapi.io/api/v1"
 
-# ─── LEAGUE PARAMETERS (for Monte Carlo fallback) ───
+# ─── LEAGUE PARAMETERS ──────────────────────────────
 LEAGUE_PARAMS = {
     "premier_league": {"avg_goals": 2.7, "home_adv": 1.35},
     "la_liga": {"avg_goals": 2.5, "home_adv": 1.40},
@@ -46,7 +44,7 @@ def get_league_params(league_name):
 # ─── ENDPOINTS ──────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/diagnostic"]}
+    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/diagnostic", "/scan-debug"]}
 
 @app.get("/health")
 async def health():
@@ -57,12 +55,10 @@ async def diagnostic():
     today = datetime.now(SAST).strftime("%Y-%m-%d")
     diag = {"date": today, "bzzoiro": {}, "sharpapi": {}}
 
-    # Test Bzzoiro
     if BZZOIRO_KEY:
         urls = [
             "https://api.bzzoiro.com/v1/fixtures",
             "https://sports.bzzoiro.com/api/v1/fixtures",
-            "https://api.bzzoiro.com/v1/predictions",
         ]
         for url in urls:
             try:
@@ -77,7 +73,6 @@ async def diagnostic():
     else:
         diag["bzzoiro"]["status"] = "no_key_configured"
 
-    # Test SharpAPI
     try:
         r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
                         params={"sport": "soccer", "date": today, "per_page": 10}, timeout=15)
@@ -88,6 +83,115 @@ async def diagnostic():
         diag["sharpapi"] = {"error": str(e)}
 
     return diag
+
+@app.get("/scan-debug")
+async def scan_debug():
+    """Show exactly what happens during market scanning."""
+    today = datetime.now(SAST).strftime("%Y-%m-%d")
+    debug = {"date": today, "matches": []}
+
+    # Fetch all odds
+    all_odds = []
+    for page in range(1, 3):
+        r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
+                        params={"sport": "soccer", "date": today, "per_page": 100, "page": page}, timeout=15)
+        if r.status_code != 200:
+            break
+        data = r.json()
+        odds_page = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+        if not odds_page:
+            break
+        all_odds.extend(odds_page)
+
+    # Group by match
+    matches = {}
+    for odd in all_odds:
+        if not isinstance(odd, dict):
+            continue
+        home = str(odd.get("home_team", "")).strip()
+        away = str(odd.get("away_team", "")).strip()
+        if not home or not away:
+            continue
+        key = f"{home} vs {away}"
+        if key not in matches:
+            league = str(odd.get("league", "default"))
+            params = get_league_params(league)
+            matches[key] = {
+                "home": home, "away": away, "league": league,
+                "avg_goals": params["avg_goals"], "home_adv": params["home_adv"],
+                "odds": []
+            }
+        matches[key]["odds"].append(odd)
+
+    # For each match, show what the scanner sees
+    for key, match in list(matches.items())[:3]:
+        # Run simulation
+        lambda_h = (match["avg_goals"] / 2) * match["home_adv"]
+        lambda_a = match["avg_goals"] / 2
+        np.random.seed(42)
+        hg = np.random.poisson(lambda_h, 20000)
+        ag = np.random.poisson(lambda_a, 20000)
+        tg = hg + ag
+        sim = {
+            "home_win": float(np.mean(hg > ag)),
+            "draw": float(np.mean(hg == ag)),
+            "away_win": float(np.mean(hg < ag)),
+            "over_2.5": float(np.mean(tg > 2.5)),
+            "btts_yes": float(np.mean((hg > 0) & (ag > 0))),
+        }
+
+        # Show each odd and whether it passes filters
+        odd_debug = []
+        for odd in match["odds"]:
+            if not isinstance(odd, dict):
+                continue
+            mkt_type = str(odd.get("market_type", "")).lower()
+            selection = str(odd.get("selection", "")).lower()
+            sel_type = str(odd.get("selection_type", "")).lower()
+
+            # Get decimal odds
+            dec = odd.get("odds_decimal")
+            if dec and float(dec) > 1.0:
+                price = float(dec)
+            else:
+                american = odd.get("odds_american")
+                if american:
+                    am = int(american)
+                    price = round((am / 100) + 1, 2) if am > 0 else round((100 / abs(am)) + 1, 2)
+                else:
+                    price = 0
+
+            # Check market mapping
+            market_map = {
+                "moneyline": ["home_win", "draw", "away_win"],
+                "totals": ["over_2.5"],
+                "both_teams_to_score": ["btts_yes"],
+            }
+
+            mapped = market_map.get(mkt_type, [])
+            sim_prob = sim.get(mapped[0], 0) if mapped else 0
+
+            odd_debug.append({
+                "market_type": mkt_type,
+                "selection": selection,
+                "selection_type": sel_type,
+                "price": price,
+                "in_market_map": bool(mapped),
+                "sim_prob": round(sim_prob, 3),
+                "implied": round(1/price, 3) if price > 0 else 0,
+                "edge": round(sim_prob - 1/price, 3) if price > 0 and mapped else 0,
+                "passes": price > 1.1 and price < 15.0 and bool(mapped) and sim_prob >= 0.10
+            })
+
+        debug["matches"].append({
+            "fixture": key,
+            "league": match["league"],
+            "simulation": sim,
+            "total_odds": len(match["odds"]),
+            "odds_scan": odd_debug
+        })
+
+    return debug
 
 @app.get("/analyze")
 @app.post("/analyze")
@@ -102,7 +206,6 @@ async def analyze():
 class FallbackEngine:
     def __init__(self, simulations: int = 20000):
         self.simulations = simulations
-        self.source = "unknown"
 
     def run(self):
         today = datetime.now(SAST).strftime("%Y-%m-%d")
@@ -119,7 +222,7 @@ class FallbackEngine:
                         result["fallback"] = False
                         return result
             except Exception:
-                pass  # Bzzoiro failed, fall through
+                pass
 
         # ── FALLBACK TO SHARPAPI + MONTE CARLO ──
         try:
@@ -134,9 +237,7 @@ class FallbackEngine:
 
         return {"status": "no_matches", "message": "No matches or odds found today."}
 
-    # ─── BZZOIRO METHODS ──────────────────────────────
     def _try_bzzoiro(self, today):
-        """Attempt to fetch fixtures from Bzzoiro. Returns list or None."""
         urls = [
             "https://api.bzzoiro.com/v1/fixtures",
             "https://sports.bzzoiro.com/api/v1/fixtures",
@@ -163,7 +264,6 @@ class FallbackEngine:
             league = fixture.get("league", "Unknown")
             match_id = fixture.get("id", f"{home}-{away}")
 
-            # Get Bzzoiro predictions
             predictions = fixture.get("predictions", {}) if isinstance(fixture.get("predictions"), dict) else {}
             if not predictions:
                 predictions = fixture.get("ml", {}) if isinstance(fixture.get("ml"), dict) else {}
@@ -175,7 +275,6 @@ class FallbackEngine:
             away_prob = predictions.get("away_win", predictions.get("away", 0.33))
             confidence = predictions.get("confidence", 0.5)
 
-            # Match odds from SharpAPI
             match_odds = []
             for odd in all_odds:
                 if not isinstance(odd, dict):
@@ -185,7 +284,6 @@ class FallbackEngine:
                 if (home.lower() in oh or oh in home.lower()) and (away.lower() in oa or oa in away.lower()):
                     match_odds.append(odd)
 
-            # Scan markets
             markets = [
                 ("1X2", "Home Win", home_prob, "moneyline", ["home"]),
                 ("1X2", "Draw", draw_prob, "moneyline", ["draw"]),
@@ -232,15 +330,12 @@ class FallbackEngine:
             "status": "success" if accas else "no_value",
             "timestamp": datetime.now(SAST).isoformat(),
             "timezone": "SAST",
-            "simulations": self.simulations,
             "matches_scanned": len(fixtures),
             "markets_scanned": len(all_picks),
             "accumulators": accas
         }
 
-    # ─── SHARPAPI + MONTE CARLO METHODS ───────────────
     def _fetch_sharpapi_odds(self, today):
-        """Fetch ALL odds from SharpAPI."""
         all_odds = []
         for page in range(1, 6):
             url = f"{BASE_SHARP}/odds"
@@ -256,7 +351,6 @@ class FallbackEngine:
         return all_odds
 
     def _fetch_sharpapi_matches(self, today):
-        """Fetch odds and group by match."""
         all_odds = self._fetch_sharpapi_odds(today)
         matches = {}
         for odd in all_odds:
@@ -396,7 +490,6 @@ class FallbackEngine:
         picks.sort(key=lambda x: x["edge"], reverse=True)
         return picks
 
-    # ─── SHARED HELPERS ───────────────────────────────
     def _get_decimal_odds(self, odd):
         dec = odd.get("odds_decimal")
         if dec and float(dec) > 1.0:
