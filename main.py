@@ -26,7 +26,7 @@ BASE_SHARP = "https://api.sharpapi.io/api/v1"
 # ─── ENDPOINTS ──────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/debug", "/diagnostic"]}
+    return {"status": "ODDS HUNTER API is live", "endpoints": ["/health", "/analyze", "/diagnostic", "/debug"]}
 
 @app.get("/health")
 async def health():
@@ -52,11 +52,11 @@ async def debug():
 
 @app.get("/diagnostic")
 async def diagnostic():
-    """Shows exactly what the engine sees — fixtures, odds, matching, probabilities."""
+    """Shows exactly what both APIs return — fixtures, odds, and matching."""
     today = datetime.now(SAST).strftime("%Y-%m-%d")
-    diag = {"date": today, "fixtures": [], "odds_count": 0, "matches_with_odds": 0, "value_picks": []}
+    diag = {"date": today, "fixtures": [], "odds_summary": {}, "matches_with_odds": 0, "value_picks": []}
 
-    # Fetch fixtures
+    # ── Fetch fixtures from Big Balls ──
     try:
         r = requests.get(f"{BASE_BB}/matches", headers=HEADERS_BB,
                          params={"sport": "football", "date": today, "include": "stats,elo,lineups,injuries", "per_page": 100}, timeout=30)
@@ -64,22 +64,49 @@ async def diagnostic():
     except Exception as e:
         return {"error": f"Big Balls failed: {str(e)}"}
 
-    # Fetch all odds
+    diag["fixture_count"] = len(fixtures)
+
+    # ── Fetch ALL odds from SharpAPI (multiple pages if needed) ──
+    all_odds = []
     try:
-        r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
-                         params={"sport": "soccer", "date": today, "per_page": 500}, timeout=15)
-        all_odds = r.json().get("data", []) if isinstance(r.json(), dict) else r.json() if isinstance(r.json(), list) else []
+        for page in range(1, 4):  # Try up to 3 pages
+            r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
+                             params={"sport": "soccer", "date": today, "per_page": 100, "page": page}, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                odds_page = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                if not odds_page:
+                    break
+                all_odds.extend(odds_page)
+            else:
+                break
     except Exception as e:
         return {"error": f"SharpAPI failed: {str(e)}"}
 
-    diag["odds_count"] = len(all_odds)
+    diag["odds_summary"] = {
+        "total_odds_fetched": len(all_odds),
+        "first_10_odds_teams": []
+    }
 
-    # Show first 3 fixtures and their matched odds
-    for match in fixtures[:5]:
+    # Show team names from first 10 odds
+    for odd in all_odds[:10]:
+        if isinstance(odd, dict):
+            diag["odds_summary"]["first_10_odds_teams"].append({
+                "home": odd.get("home_team"),
+                "away": odd.get("away_team"),
+                "market": odd.get("market_type"),
+                "selection": odd.get("selection"),
+                "odds": odd.get("odds_decimal"),
+                "book": odd.get("sportsbook")
+            })
+
+    # ── Match odds to fixtures ──
+    for match in fixtures[:10]:
         if not isinstance(match, dict):
             continue
         home = match.get("home", {}).get("name", "") if isinstance(match.get("home"), dict) else ""
         away = match.get("away", {}).get("name", "") if isinstance(match.get("away"), dict) else ""
+        league = match.get("league", "Unknown") if isinstance(match, dict) else "Unknown"
 
         # Find matching odds
         match_odds = []
@@ -93,70 +120,29 @@ async def diagnostic():
                     "book": odd.get("sportsbook"),
                     "market": odd.get("market_type"),
                     "selection": odd.get("selection"),
+                    "selection_type": odd.get("selection_type"),
                     "odds": odd.get("odds_decimal")
                 })
 
-        # Get Elo
-        elo = match.get("predictions", {}).get("elo", {}) if isinstance(match.get("predictions"), dict) else {}
-
-        # Get stats
-        h_stats = match.get("home", {}).get("recent_stats", {}) if isinstance(match.get("home"), dict) else {}
-        a_stats = match.get("away", {}).get("recent_stats", {}) if isinstance(match.get("away"), dict) else {}
-
-        # Simple Poisson with defaults
-        league_avg = 2.65
-        home_att = h_stats.get("goals_scored_pg", 1.4) / (league_avg / 2) if h_stats else 1.0
-        home_def = h_stats.get("goals_conceded_pg", 1.1) / (league_avg / 2) if h_stats else 1.0
-        away_att = a_stats.get("goals_scored_pg", 1.2) / (league_avg / 2) if a_stats else 1.0
-        away_def = a_stats.get("goals_conceded_pg", 1.3) / (league_avg / 2) if a_stats else 1.0
-
-        elo_diff = (elo.get("home_elo", 1500) - elo.get("away_elo", 1500)) / 400
-        elo_mult = 10 ** elo_diff
-        lambda_h = (league_avg / 2) * home_att * away_def * 1.35 * elo_mult
-        lambda_a = (league_avg / 2) * away_att * home_def / elo_mult
-
-        # Quick simulation (1000 runs for speed)
-        np.random.seed(42)
-        hg = np.random.poisson(max(lambda_h, 0.3), 1000)
-        ag = np.random.poisson(max(lambda_a, 0.3), 1000)
-        home_win_prob = float(np.mean(hg > ag))
-        over25_prob = float(np.mean((hg + ag) > 2.5))
-        btts_prob = float(np.mean((hg > 0) & (ag > 0)))
-
-        # Check for value in moneyline home win
-        home_odd = None
-        for odd in match_odds:
-            if odd["market"] == "moneyline" and "home" in str(odd["selection"]).lower():
-                home_odd = odd["odds"]
-                break
-
-        edge = None
-        if home_odd:
-            implied = 1 / home_odd
-            edge = round(home_win_prob - implied, 3)
+        # Get stats availability
+        h_stats = match.get("home", {}).get("recent_stats") if isinstance(match.get("home"), dict) else None
+        a_stats = match.get("away", {}).get("recent_stats") if isinstance(match.get("away"), dict) else None
+        elo = match.get("predictions", {}).get("elo") if isinstance(match.get("predictions"), dict) else None
 
         diag["fixtures"].append({
             "fixture": f"{home} vs {away}",
-            "has_stats": bool(h_stats and a_stats),
-            "elo_home": elo.get("home_elo"),
-            "elo_away": elo.get("away_elo"),
-            "lambda_h": round(lambda_h, 2),
-            "lambda_a": round(lambda_a, 2),
-            "sim_home_win": round(home_win_prob, 2),
-            "sim_over25": round(over25_prob, 2),
-            "sim_btts": round(btts_prob, 2),
+            "league": league,
+            "has_home_stats": bool(h_stats),
+            "has_away_stats": bool(a_stats),
+            "has_elo": bool(elo),
+            "elo_home": elo.get("home_elo") if isinstance(elo, dict) else None,
+            "elo_away": elo.get("away_elo") if isinstance(elo, dict) else None,
             "odds_found": len(match_odds),
-            "sample_odds": match_odds[:3],
-            "home_odd": home_odd,
-            "implied_prob": round(1/home_odd, 3) if home_odd else None,
-            "edge": edge
+            "sample_odds": match_odds[:5]
         })
 
         if match_odds:
             diag["matches_with_odds"] += 1
-
-        if edge and edge > 0:
-            diag["value_picks"].append({"fixture": f"{home} vs {away}", "edge": edge})
 
     return diag
 
@@ -190,17 +176,19 @@ class MonteCarloEngine:
 
     def fetch_all_odds(self):
         today = datetime.now(SAST).strftime("%Y-%m-%d")
-        url = f"{BASE_SHARP}/odds"
-        params = {"sport": "soccer", "date": today, "per_page": 500}
-        r = requests.get(url, headers=HEADERS_SHARP, params=params, timeout=15)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if isinstance(data, dict):
-            return data.get("data", [])
-        if isinstance(data, list):
-            return data
-        return []
+        all_odds = []
+        for page in range(1, 4):
+            url = f"{BASE_SHARP}/odds"
+            params = {"sport": "soccer", "date": today, "per_page": 100, "page": page}
+            r = requests.get(url, headers=HEADERS_SHARP, params=params, timeout=15)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            odds_page = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+            if not odds_page:
+                break
+            all_odds.extend(odds_page)
+        return all_odds
 
     def match_odds_to_fixture(self, fixture, all_odds):
         home = ""
