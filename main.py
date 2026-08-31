@@ -11,22 +11,16 @@ import traceback
 app = FastAPI()
 
 # ─── CONFIG ─────────────────────────────────────────
-THESPORTSDB_KEY = os.getenv("THESPORTSDB_KEY", "1")  # Free tier uses key=1
 SHARPAPI_KEY = os.getenv("SHARPAPI_KEY")
 
 if not SHARPAPI_KEY:
     raise RuntimeError("SHARPAPI_KEY missing. Set it in Render Environment Variables.")
 
 SAST = ZoneInfo("Africa/Johannesburg")
-
-# TheSportsDB (free, no key needed for basic endpoints)
-BASE_SPORTSDB = "https://www.thesportsdb.com/api/v1/json/1"
-
-# SharpAPI
 HEADERS_SHARP = {"X-API-Key": SHARPAPI_KEY}
 BASE_SHARP = "https://api.sharpapi.io/api/v1"
 
-# ─── LEAGUE PARAMETERS (for Monte Carlo) ──────────────
+# ─── LEAGUE PARAMETERS ──────────────────────────────
 LEAGUE_PARAMS = {
     "premier_league": {"avg_goals": 2.7, "home_adv": 1.35},
     "la_liga": {"avg_goals": 2.5, "home_adv": 1.40},
@@ -56,7 +50,6 @@ async def health():
 
 @app.get("/diagnostic")
 async def diagnostic():
-    """Show what SharpAPI has for today."""
     today = datetime.now(SAST).strftime("%Y-%m-%d")
     try:
         r = requests.get(f"{BASE_SHARP}/odds", headers=HEADERS_SHARP,
@@ -64,7 +57,6 @@ async def diagnostic():
         data = r.json()
         odds = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
 
-        # Group by match
         matches = {}
         for odd in odds:
             if not isinstance(odd, dict):
@@ -78,7 +70,6 @@ async def diagnostic():
                 matches[key] = {"league": odd.get("league"), "markets": set()}
             matches[key]["markets"].add(odd.get("market_type"))
 
-        # Convert sets to lists for JSON
         for k in matches:
             matches[k]["markets"] = list(matches[k]["markets"])
 
@@ -106,7 +97,6 @@ class OddsHunterEngine:
         self.simulations = simulations
 
     def fetch_sharpapi_odds(self):
-        """Fetch ALL odds from SharpAPI and group by match."""
         today = datetime.now(SAST).strftime("%Y-%m-%d")
         all_odds = []
         for page in range(1, 6):
@@ -121,7 +111,6 @@ class OddsHunterEngine:
                 break
             all_odds.extend(odds_page)
 
-        # Group by match
         matches = {}
         for odd in all_odds:
             if not isinstance(odd, dict):
@@ -144,7 +133,6 @@ class OddsHunterEngine:
         return list(matches.values())
 
     def simulate(self, avg_goals, home_adv):
-        """Monte Carlo with league-average parameters."""
         lambda_h = (avg_goals / 2) * home_adv
         lambda_a = avg_goals / 2
         np.random.seed(42)
@@ -167,7 +155,6 @@ class OddsHunterEngine:
         }
 
     def get_decimal_odds(self, odd):
-        """Extract decimal odds from SharpAPI response."""
         dec = odd.get("odds_decimal")
         if dec and float(dec) > 1.0:
             return float(dec)
@@ -181,13 +168,13 @@ class OddsHunterEngine:
         return 0
 
     def scan_markets(self, match, sim):
-        """Find value in all available odds for this match."""
         picks = []
         home = match["home"]
         away = match["away"]
         league = match["league"]
 
-        # Map our markets to SharpAPI markets
+        # Map SharpAPI market_type names to our internal format
+        # SharpAPI uses: moneyline, double_chance, both_teams_to_score, correct_score, totals, spreads
         market_map = {
             "moneyline": [
                 ("1X2", "Home Win", "home_win", ["home"]),
@@ -198,9 +185,13 @@ class OddsHunterEngine:
                 ("O/U 2.5", "Over 2.5", "over_2.5", ["over", "o"]),
                 ("O/U 2.5", "Under 2.5", "over_2.5", ["under", "u"]),
             ],
-            "btts": [
+            "both_teams_to_score": [
                 ("BTTS", "Yes", "btts_yes", ["yes", "y"]),
                 ("BTTS", "No", "btts_no", ["no", "n"]),
+            ],
+            "double_chance": [
+                ("DC", "Home/Draw", "home_or_draw", ["home/draw", "1x"]),
+                ("DC", "Away/Draw", "away_or_draw", ["away/draw", "x2"]),
             ],
             "spreads": [
                 ("AH -1", "Home -1", "ah_home_minus1", ["home"]),
@@ -232,16 +223,16 @@ class OddsHunterEngine:
                     continue
 
                 prob = sim.get(sim_key, 0)
-                if prob < 0.15:
+                if prob < 0.10:  # Lowered from 0.15
                     continue
 
                 implied = 1 / best_odd
-                if "Under" in sel_label:
+                if "Under" in sel_label or "No" in sel_label:
                     prob = 1 - prob
 
                 edge = prob - implied
-                if edge >= 0.03 and prob >= 0.45:
-                    conf = "A+" if edge > 0.10 else "A" if edge > 0.07 else "B"
+                if edge >= 0.02 and prob >= 0.40:  # Lowered thresholds for obscure leagues
+                    conf = "A+" if edge > 0.10 else "A" if edge > 0.06 else "B"
                     exp = f"Monte Carlo ({self.simulations:,} runs): {sel_label} = {prob*100:.1f}%. {book} @ {best_odd} (implied {implied*100:.1f}%). Edge: {edge*100:.1f}%."
                     picks.append({
                         "match_id": f"{home}-{away}",
